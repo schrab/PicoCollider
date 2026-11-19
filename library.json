@@ -1,0 +1,11 @@
+{
+  "name": "picocollider",
+  "version": "0.1.0",
+  "description": "Reusable, reference-exact SuperCollider DSP building blocks for RP2350/RP2040 (Cortex-M33/M0+) projects",
+  "keywords": "dsp, audio, supercollider, rp2350, pico2, cmsis",
+  "repository": { "type": "git", "url": "https://github.com/schrab/PicoCollider.git" },
+  "license": "GPL-3.0-or-later (see LICENSE.md; sc3p ports carry their own licenses)",
+  "frameworks": "arduino",
+  "platforms": "raspberrypi",
+  "build": { "includeDir": "include", "flags": ["-O3"] }
+}
