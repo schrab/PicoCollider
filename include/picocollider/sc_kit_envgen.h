@@ -61,7 +61,9 @@ struct EnvGen {
       counter_ = 0; residual_ = 0.;
     } else if (gate <= -1.f && prev_gate_ > -1.f) {
       const double dur = -static_cast<double>(gate) - 1.;
-      counter_ = std::max(1, static_cast<int32_t>(dur * sr_));
+      // Explicit template arg: on the embedded ABI int32_t may be `long`, so
+      // std::max(1, int32_t) fails template deduction there.
+      counter_ = std::max<int32_t>(1, static_cast<int32_t>(dur * sr_));
       stage_ = num_stages_ - 1;
       released_ = true;
       InitSegment(counter_, level_, dur);
@@ -99,7 +101,7 @@ struct EnvGen {
     const double stage_dur = dur * sr_ + residual_;
     const int32_t floor_v = static_cast<int32_t>(stage_dur);
     const double counter_frac = std::max(1.0, stage_dur);
-    counter = std::max(1, floor_v);
+    counter = std::max<int32_t>(1, floor_v);
     residual_ = stage_dur - counter;
     if (counter == 1) shape_ = Linear;
 
