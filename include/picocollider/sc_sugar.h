@@ -34,7 +34,7 @@ struct SelectX {
     if (p > 1.f) p = 1.f;
     if (p < -1.f) p = -1.f;
     const int idx = static_cast<int>((p + 1.f) * 1024.f + 0.5f);
-    const float la = t_->sine[2048 - idx], ra = t_->sine[idx];
+    const float la = t_->sine_q[2048 - idx], ra = t_->sine_q[idx];
     for (int i = 0; i < n; ++i) {
       auto sel = [&](int k) -> float {
         if (count < 1) return 0.f;

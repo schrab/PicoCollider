@@ -52,7 +52,7 @@ class Saw {
     float t1 = tbl[1];
     const float pfrac = PhaseFrac(phase);
     if (t0 == kBadValue || t1 == kBadValue) {
-      tbl = t_->sine + ((phase >> 16) & (kSineSize - 1));
+      tbl = t_->sine_full + ((phase >> 16) & (kSineSize - 1));
       t0 = tbl[0];
       t1 = tbl[1];
       const float denom = t0 + (t1 - t0) * pfrac;
@@ -75,7 +75,7 @@ class Saw {
     return n1 + xfade * (n2 - n1);
   }
   float SineAt(uint32_t rphase) const {
-    const float* tbl = t_->sine + ((rphase >> 16) & (kSineSize - 1));
+    const float* tbl = t_->sine_full + ((rphase >> 16) & (kSineSize - 1));
     return lininterp(PhaseFrac(rphase), tbl[0], tbl[1]);
   }
   void ProcessBlock(float* out, int n);

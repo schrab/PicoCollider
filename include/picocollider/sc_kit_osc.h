@@ -22,13 +22,20 @@ namespace sc {
 constexpr int kSineSize = 8192;      // include/plugin_interface/SC_Complex.h
 constexpr float kBadValue = 1e20f;   // include/plugin_interface/SC_Constants.h
 
-// exact 131,080 B: 2*8192 + 8193 + 8193 floats
+// T-D2 device memory law: the two BLIT tables (gSine / gInvSine, 8,193 floats
+// each) are LAZY. The pan family (Pan2/Balance2/SelectX) only indexes the
+// first quarter of gSine, so that quarter is INLINE and always built; the
+// full sine + cosecant (used by Pulse, the BLIT Saw, Rotate2, PanAz) are
+// built on demand into an arena block via EnsurePulseTables
+// (dronecaster_engine.h). Values are identical either way (same sin() law).
 struct KitTables {
-  float sine_wt[2 * kSineSize];   // SC gSineWavetable: pairs {2a-b, b-a}
-  float sine[kSineSize + 1];      // SC gSine (Pulse numerator)
-  float cosecant[kSineSize + 1];  // SC gInvSine (Pulse denominator)
+  float* sine_full;                  // SC gSine[0..8192] when built, else null
+  float* cosecant;                   // SC gInvSine[0..8192] when built, else null
+  float sine_wt[2 * kSineSize];      // SC gSineWavetable: pairs {2a-b, b-a}
+  float sine_q[kSineSize / 4 + 2];   // SC gSine[0..2048] + 1 pad (8-align)
 };
-static_assert(sizeof(KitTables) == (2 * kSineSize + 2 * (kSineSize + 1)) * 4,
+static_assert(sizeof(KitTables) ==
+                  2 * sizeof(float*) + (2 * kSineSize + kSineSize / 4 + 2) * 4,
               "KitTables layout/padding changed");
 
 // SC_SndBuf.h PhaseFrac
@@ -56,36 +63,61 @@ inline float lookupi1(const float* table0, const float* table1,
   return val1 + val2 * pfrac;
 }
 
-inline void InitKitTables(KitTables* t) {
+// The single sine-sample law (SC FillTables: float32 d = sin(phase), phase =
+// i * 2pi / kSineSize, double math). Every table (wavetable pairs, the pan
+// quarter, the full BLIT tables) derives from this one formula, so a lazily
+// built table is bit-identical to the eagerly built one.
+inline float SineTableSample(int i) {
   const double twopi = 6.283185307179586476925286766559;
   const double sineIndexToPhase = twopi / kSineSize;
-  for (int i = 0; i <= kSineSize; ++i) {
-    const double phase = i * sineIndexToPhase;
-    const float d = static_cast<float>(std::sin(phase));   // SC: float32 d = sin(phase)
-    t->sine[i] = d;
-    t->cosecant[i] = static_cast<float>(1.0 / static_cast<double>(d));
-  }
-  // SignalAsWavetable(gSine, gSineWavetable, kSineSize) — common/Samp.cpp
+  return static_cast<float>(std::sin(static_cast<double>(i) * sineIndexToPhase));
+}
+
+inline void InitKitTables(KitTables* t) {
+  // SignalAsWavetable(gSine, gSineWavetable, kSineSize) — common/Samp.cpp.
+  // The pairs come from consecutive sine samples; they are computed from the
+  // sine law directly (the full gSine array may not exist yet — lazy BLIT
+  // tables, T-D2 device memory law).
   float val1, val2;
   float* out = t->sine_wt - 1;
   for (int i = 0; i < kSineSize - 1; ++i) {
-    val1 = t->sine[i];
-    val2 = t->sine[i + 1];
+    val1 = SineTableSample(i);
+    val2 = SineTableSample(i + 1);
     *++out = 2.0f * val1 - val2;
     *++out = val2 - val1;
   }
-  val1 = t->sine[kSineSize - 1];
-  val2 = t->sine[0];
+  val1 = SineTableSample(kSineSize - 1);
+  val2 = SineTableSample(0);
   *++out = 2.0f * val1 - val2;
   *++out = val2 - val1;
+  // The pan quarter (gSine[0..2048]) — Pan2/Balance2/SelectX index range.
+  for (int i = 0; i <= kSineSize / 4; ++i) t->sine_q[i] = SineTableSample(i);
+  t->sine_full = nullptr;   // BLIT tables are built on demand
+  t->cosecant = nullptr;
+}
+
+// Builds the full gSine + gInvSine tables into `block` (2*(kSineSize+1)
+// floats, caller-owned/arena) and points the KitTables at them.
+// common/Samp.cpp FillTables: gSine[i] = (float)sin(phase); gInvSine[i] =
+// (float)(1.0 / (double)d); then the kBadValue bands around the discontinuity.
+inline void BuildPulseTables(KitTables* t, float* block) {
+  float* full = block;
+  float* inv = block + (kSineSize + 1);
+  for (int i = 0; i <= kSineSize; ++i) {
+    const float d = SineTableSample(i);
+    full[i] = d;
+    inv[i] = static_cast<float>(1.0 / static_cast<double>(d));
+  }
   // kBadValue bands — common/Samp.cpp
-  t->cosecant[0] = t->cosecant[kSineSize / 2] = t->cosecant[kSineSize] = kBadValue;
+  inv[0] = inv[kSineSize / 2] = inv[kSineSize] = kBadValue;
   const int sz = kSineSize;
   const int sz2 = sz >> 1;
   for (int i = 1; i <= 8; ++i) {
-    t->cosecant[i] = t->cosecant[sz - i] = kBadValue;
-    t->cosecant[sz2 - i] = t->cosecant[sz2 + i] = kBadValue;
+    inv[i] = inv[sz - i] = kBadValue;
+    inv[sz2 - i] = inv[sz2 + i] = kBadValue;
   }
+  t->sine_full = full;
+  t->cosecant = inv;
 }
 
 // SinOsc (OscUGens.cpp:1325-1351 Ctor, 1302-1320 Osc_iai_perform).

@@ -136,14 +136,39 @@ struct Compander {
 };
 
 // Limiter — FilterUGens.cpp:3394 (ctor), 3421 (next). Lookahead ring layout.
+// T-D2 device storage law: Init() keeps the std::vector (kit refs/tests);
+// InitExt() places the 3*bufsize table in caller-owned storage (the device
+// drone path never heap-allocates — see sc_kit_delay.h's comment).
 struct Limiter {
+  long bufsize_for(double sr, float dur) const {
+    long b = static_cast<long>(std::ceil(static_cast<double>(dur) * sr));
+    return b < 1 ? 1 : b;
+  }
   void Init(double sr, float amp, float dur, float first_in) {
-    bufsize_ = static_cast<long>(std::ceil(static_cast<double>(dur) * sr));
-    if (bufsize_ < 1) bufsize_ = 1;
+    bufsize_ = bufsize_for(sr, dur);
     table_.assign(static_cast<size_t>(bufsize_) * 3, 0.0f);
     in_ = table_.data();
     mid_ = in_ + bufsize_;
     out_ = mid_ + bufsize_;
+    CommonInit(sr, amp, dur, first_in);
+  }
+  void InitExt(float* table3x, double sr, float amp, float dur,
+               float first_in) {
+    bufsize_ = bufsize_for(sr, dur);
+    for (long i = 0; i < bufsize_ * 3; ++i) table3x[i] = 0.0f;
+    in_ = table3x;
+    mid_ = in_ + bufsize_;
+    out_ = mid_ + bufsize_;
+    CommonInit(sr, amp, dur, first_in);
+  }
+  void ProcessBlock(const float* in, float* out, int n) {
+    for (int i = 0; i < n; ++i) Step(in[i], out[i]);
+  }
+  float ctor_value() const { return 0.0f; }
+
+ private:
+  void CommonInit(double sr, float amp, float dur, float first_in) {
+    (void)sr; (void)dur;
     amp_ = amp;
     pos_ = 0;
     flips_ = 0;
@@ -155,12 +180,6 @@ struct Limiter {
     float unused;
     Step(first_in, unused);  // ctor's Limiter_next(unit, 1)
   }
-  void ProcessBlock(const float* in, float* out, int n) {
-    for (int i = 0; i < n; ++i) Step(in[i], out[i]);
-  }
-  float ctor_value() const { return 0.0f; }
-
- private:
   void Step(float x, float& out) {
     in_[pos_] = x;
     if (flips_ >= 2) {
@@ -186,7 +205,7 @@ struct Limiter {
       ++flips_;
     }
   }
-  std::vector<float> table_;
+  std::vector<float> table_;   // vector mode only (kit refs/tests)
   float* in_ = nullptr;
   float* mid_ = nullptr;
   float* out_ = nullptr;

@@ -43,8 +43,8 @@ struct Pan2 {
   void Compute(float pos, float level, float* l, float* r) const {
     int ipos = static_cast<int32_t>(1024.f * pos + 1024.f + 0.5f);
     ipos = clampf(static_cast<float>(ipos), 0.f, 2048.f);
-    *l = level * t_->sine[2048 - ipos];
-    *r = level * t_->sine[ipos];
+    *l = level * t_->sine_q[2048 - ipos];
+    *r = level * t_->sine_q[ipos];
   }
   static void Step(float x, float la, float ra, float& l, float& r) {
     l = x * la;
@@ -87,8 +87,8 @@ struct Balance2 {
   void Compute(float pos, float level, float* l, float* r) const {
     int ipos = static_cast<int32_t>(1024.f * pos + 1024.f + 0.5f);
     ipos = clampf(static_cast<float>(ipos), 0.f, 2048.f);
-    *l = level * t_->sine[2048 - ipos];
-    *r = level * t_->sine[ipos];
+    *l = level * t_->sine_q[2048 - ipos];
+    *r = level * t_->sine_q[ipos];
   }
   static void Step(float xl, float xr, float la, float ra, float& l,
                    float& r) {
@@ -129,8 +129,8 @@ struct Rotate2 {
   void Compute(float pos, float* s, float* c) const {
     const int32_t isinpos = 8191 & static_cast<int32_t>(4096.f * pos);
     const int32_t icospos = 8191 & (2048 + isinpos);
-    *s = t_->sine[isinpos];
-    *c = t_->sine[icospos];
+    *s = t_->sine_full[isinpos];
+    *c = t_->sine_full[icospos];
   }
   static void Step(float x, float y, float cost, float sint, float& xo,
                    float& yo) {
@@ -226,7 +226,7 @@ struct PanAz {
       chanpos = chanpos - range * std::floor(rrange * chanpos);
       (*out)[static_cast<size_t>(i)] =
           chanpos >= 1.f ? 0.f
-                         : level * t_->sine[static_cast<long>(4096.f * chanpos)];
+                         : level * t_->sine_full[static_cast<long>(4096.f * chanpos)];
     }
   }
   KitTables* t_ = nullptr;

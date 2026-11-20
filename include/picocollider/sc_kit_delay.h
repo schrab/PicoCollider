@@ -32,6 +32,22 @@ static inline float CubicInterp(float x, float y0, float y1, float y2,
   return ((c3 * x + c2) * x + c1) * x + c0;
 }
 
+// T-D2 device storage law: the kit DelayLine supports THREE storages.
+//   - Init():    std::vector heap ring (kit refs / host tests only — the
+//                dronecaster device path NEVER heap-allocates: the drone
+//                inits run on core 1 and the device heap is ~22 KB, not
+//                multicore-safe, and far too small for these rings).
+//   - InitExt(): caller-owned float ring, any size. Device drones allocate
+//                the storage from the engine arena/aux, sized from the
+//                graph's delaytime bound + margin.
+//   - InitExt16(): caller-owned int16 ring (storage compression, e.g.
+//                Sachiko): float arithmetic, quantized on write (round-half-
+//                away-from-zero, saturated) and dequantized on read;
+//                scale = the float value of one LSB.
+// The wrap is arithmetic over a maintained write position (works for any
+// size; identical values to the old pow2 mask wrap). The clamp ceiling is
+// bufsize-4 in the ext modes (checked-phase reads reach back dsamp+2 and
+// forward +1) and bufsize / bufsize-1 in the vector / Buf modes (source law).
 struct DelayLine {
   void Init(double sr, float maxdelay, float delay, float decay, int kind) {
     sr_ = static_cast<float>(sr);
@@ -42,8 +58,10 @@ struct DelayLine {
     bufsize_ = 1;
     while (bufsize_ < sz) bufsize_ <<= 1;
     buf_.assign(static_cast<size_t>(bufsize_), 0.f);
-    mask_ = bufsize_ - 1;
+    datap_ = buf_.data();
+    qbuf_ = nullptr;
     iwrphase_ = 0;
+    wpos_ = 0;
     max_dsamp_ = static_cast<float>(bufsize_);
     dsamp_ = CalcDelay(delay);
     feedbk_ = kind_ >= 3 ? CalcFeedback(delay, decay) : 0.f;
@@ -57,9 +75,53 @@ struct DelayLine {
     decay_ = decay;
     bufsize_ = bufsamples;
     buf_.assign(static_cast<size_t>(bufsize_), 0.f);
-    mask_ = bufsize_ - 1;
+    datap_ = buf_.data();
+    qbuf_ = nullptr;
     iwrphase_ = 0;
+    wpos_ = 0;
     max_dsamp_ = static_cast<float>(bufsize_ - 1);
+    dsamp_ = CalcDelay(delay);
+    feedbk_ = kind_ >= 3 ? CalcFeedback(delay, decay) : 0.f;
+  }
+  // Caller-owned float ring (device drones): no heap; storage is zeroed (the
+  // device aux region may hold stale bytes from the previously resident
+  // module). maxdelay is informational only — the clamp ceiling is
+  // bufsize-4, so the caller sizes the ring from the graph constant.
+  void InitExt(float* buf, long floats, double sr, float maxdelay,
+               float delay, float decay, int kind) {
+    (void)maxdelay;
+    sr_ = static_cast<float>(sr);
+    kind_ = kind;
+    delay_ = delay;
+    decay_ = decay;
+    bufsize_ = floats;
+    datap_ = buf;
+    qbuf_ = nullptr;
+    for (long i = 0; i < floats; ++i) datap_[i] = 0.f;
+    iwrphase_ = 0;
+    wpos_ = 0;
+    max_dsamp_ = static_cast<float>(bufsize_ - 4);
+    dsamp_ = CalcDelay(delay);
+    feedbk_ = kind_ >= 3 ? CalcFeedback(delay, decay) : 0.f;
+  }
+  // Caller-owned int16 ring (device storage compression). scale = the float
+  // value of one LSB (ring range = +-32768*scale — size it above the graph's
+  // worst stored magnitude, feedback combs included).
+  void InitExt16(int16_t* buf, long samples, float scale, double sr,
+                 float maxdelay, float delay, float decay, int kind) {
+    (void)maxdelay;
+    sr_ = static_cast<float>(sr);
+    kind_ = kind;
+    delay_ = delay;
+    decay_ = decay;
+    bufsize_ = samples;
+    datap_ = nullptr;
+    qbuf_ = buf;
+    qscale_ = scale;
+    for (long i = 0; i < samples; ++i) qbuf_[i] = 0;
+    iwrphase_ = 0;
+    wpos_ = 0;
+    max_dsamp_ = static_cast<float>(bufsize_ - 4);
     dsamp_ = CalcDelay(delay);
     feedbk_ = kind_ >= 3 ? CalcFeedback(delay, decay) : 0.f;
   }
@@ -97,31 +159,53 @@ struct DelayLine {
                  std::fabs(static_cast<double>(decaytime))));
     return std::copysign(absret, decaytime);
   }
+  inline float LoadVal(long idx) const {
+    return qbuf_ != nullptr ? static_cast<float>(qbuf_[idx]) * qscale_
+                            : datap_[idx];
+  }
+  // Round-half-away-from-zero with saturation; deterministic on host and MCU.
+  inline void StoreVal(long idx, float v) {
+    if (qbuf_ != nullptr) {
+      float q = v * (1.0f / qscale_);
+      q = q < -32768.5f ? -32768.5f : (q > 32767.5f ? 32767.5f : q);
+      qbuf_[idx] = static_cast<int16_t>(q < 0.f ? q - 0.5f : q + 0.5f);
+    } else {
+      datap_[idx] = v;
+    }
+  }
+  // Ring index relative to the write head: (wpos_ - k) mod bufsize_, with
+  // k <= bufsize_-4 in the ext modes so one conditional add normalizes.
+  inline long WrapRel(long i) const { return i < 0 ? i + bufsize_ : i; }
   float Step(float x) {
     const long idsamp = static_cast<long>(dsamp_);
     const float frac = dsamp_ - static_cast<float>(idsamp);
+    // Checked-phase tests run on the ABSOLUTE phase (source law); the ring
+    // indices are derived from the wrapped write position wpos_ (= iwrphase_
+    // mod bufsize_) — identical values to the old mask arithmetic.
     const long ird = static_cast<long>(iwrphase_) - idsamp;
-    const long w = iwrphase_ & mask_;
-    const long r1 = ird & mask_, r0 = (ird + 1) & mask_;
-    const long rm1 = (ird - 1) & mask_, rm2 = (ird - 2) & mask_;
+    const long w = wpos_;
+    const long r1 = WrapRel(w - idsamp);
+    const long r0 = (r1 + 1 == bufsize_) ? 0 : r1 + 1;
+    const long rm1 = (r1 == 0) ? bufsize_ - 1 : r1 - 1;
+    const long rm2 = (r1 >= 2) ? r1 - 2 : r1 - 2 + bufsize_;
     float value = 0.f;
 
     if (kind_ == 0 || kind_ == 3 || kind_ == 6) {  // nearest-neighbour
       if (ird < 0) {
         // Every checked helper writes the raw input during this phase.
         if (kind_ == 6) {
-          buf_[w] = x;
+          StoreVal(w, x);
           value = -feedbk_ * x;
         } else {
-          buf_[w] = x;
+          StoreVal(w, x);
         }
       } else {
-        value = buf_[r1];
-        if (kind_ == 0) buf_[w] = x;
-        else if (kind_ == 3) buf_[w] = x + feedbk_ * value;
+        value = LoadVal(r1);
+        if (kind_ == 0) StoreVal(w, x);
+        else if (kind_ == 3) StoreVal(w, x + feedbk_ * value);
         else {  // AllpassN
           const float dwr = feedbk_ * value + x;
-          buf_[w] = dwr;
+          StoreVal(w, dwr);
           value = value - feedbk_ * dwr;
         }
       }
@@ -129,42 +213,46 @@ struct DelayLine {
       if (ird < 0) {
         value = 0.f;
       } else if (ird - 1 < 0) {
-        const float d1 = buf_[r1];
+        const float d1 = LoadVal(r1);
         value = d1 - frac * d1;
       } else {
-        value = LinInterp(frac, buf_[r1], buf_[rm1]);
+        value = LinInterp(frac, LoadVal(r1), LoadVal(rm1));
       }
-      if (kind_ == 1) buf_[w] = x;
-      else if (kind_ == 4) buf_[w] = x + feedbk_ * value;
+      if (kind_ == 1) StoreVal(w, x);
+      else if (kind_ == 4) StoreVal(w, x + feedbk_ * value);
       else {
         const float dwr = x + feedbk_ * value;
-        buf_[w] = dwr;
+        StoreVal(w, dwr);
         value = value - feedbk_ * dwr;
       }
     } else {  // cubic (2 DelayC, 5 CombC, 8 AllpassC)
       if (ird + 1 < 0) {
-        buf_[w] = x;  // source still stores the input, output stays 0
+        StoreVal(w, x);  // source still stores the input, output stays 0
       } else {
         float d0 = 0.f, d1 = 0.f, d2 = 0.f, d3 = 0.f;
-        if (ird >= 0) d1 = buf_[r1];
-        if (ird - 1 >= 0) d2 = buf_[rm1];
-        if (ird - 2 >= 0) d3 = buf_[rm2];
-        d0 = buf_[r0];
+        if (ird >= 0) d1 = LoadVal(r1);
+        if (ird - 1 >= 0) d2 = LoadVal(rm1);
+        if (ird - 2 >= 0) d3 = LoadVal(rm2);
+        d0 = LoadVal(r0);
         value = CubicInterp(frac, d0, d1, d2, d3);
-        if (kind_ == 2) buf_[w] = x;
-        else if (kind_ == 5) buf_[w] = x + feedbk_ * value;
+        if (kind_ == 2) StoreVal(w, x);
+        else if (kind_ == 5) StoreVal(w, x + feedbk_ * value);
         else {
           const float dwr = x + feedbk_ * value;
-          buf_[w] = dwr;
+          StoreVal(w, dwr);
           value = value - feedbk_ * dwr;
         }
       }
     }
     ++iwrphase_;
+    wpos_ = (wpos_ + 1 == bufsize_) ? 0 : wpos_ + 1;
     return value;
   }
-  std::vector<float> buf_;
-  long bufsize_ = 0, mask_ = 0, iwrphase_ = 0;
+  std::vector<float> buf_;          // vector mode only (refs/tests)
+  float* datap_ = nullptr;          // active float ring (vector or ext)
+  int16_t* qbuf_ = nullptr;         // int16 ring mode (device storage)
+  float qscale_ = 0.f;              // float value of one int16 LSB
+  long bufsize_ = 0, iwrphase_ = 0, wpos_ = 0;
   float sr_ = 48000.f, dsamp_ = 0.f, feedbk_ = 0.f, max_dsamp_ = 0.f;
   float delay_ = 0.f, decay_ = 0.f;
   int kind_ = 0;
