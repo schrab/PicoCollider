@@ -16,6 +16,7 @@
 #include "picocollider/sc_kit_lfo.h"
 #include "picocollider/sc_kit_localio.h"
 #include "picocollider/sc_kit_noise.h"
+#include "picocollider/sc_kit_nova.h"
 #include "picocollider/sc_kit_osc.h"
 #include "picocollider/sc_kit_osc2.h"
 #include "picocollider/sc_kit_pan.h"
@@ -38,6 +39,18 @@
 static int g_failures = 0;
 #define CHECK(cond, msg) do { if (cond) { printf("  ok: %s\n", msg); } \
     else { printf("  FAIL: %s\n", msg); ++g_failures; } } while (0)
+
+// The BLIT Saw/SinOscFB family reads the full sine + cosecant tables, which
+// are LAZY since 3cfd4a2 (caller-owned storage law — InitKitTables leaves
+// sine_full/cosecant null and the caller builds them into its own block).
+// The host test owns one shared static block (read-only after build) and
+// attaches it wherever a KitTables feeds a BLIT UGen. Every section that
+// constructs a Saw/SinOscFB uses this instead of bare InitKitTables.
+static float g_pulse_tables[2 * (8192 + 1)];
+static void InitKitTablesFull(sc::KitTables* t) {
+  sc::InitKitTables(t);
+  sc::BuildPulseTables(t, g_pulse_tables);
+}
 
 struct GoldenReport {
   long   frames_ref = 0, frames_got = 0;
@@ -235,7 +248,7 @@ int main() {
       if (!ref_check("TDelaykr", out.data(), 48000)) ++g_failures;
     }
     { // Latch.kr(SinOsc.kr(5), Impulse.kr(3))
-      static sc::KitTables kt; sc::InitKitTables(&kt);
+      static sc::KitTables kt; InitKitTablesFull(&kt);
       sc::SinOsc osc; osc.Init(&kt, 750.0, 5.0f);
       sc::Impulse imp; imp.Init(750.0, 3.0f);
       sc::Latch u; u.Init();
@@ -250,7 +263,7 @@ int main() {
       if (!ref_check("SetResetkr", out.data(), 48000)) ++g_failures;
     }
     { // Peak.kr(SinOsc.kr(7), Impulse.kr(1))
-      static sc::KitTables kt; sc::InitKitTables(&kt);
+      static sc::KitTables kt; InitKitTablesFull(&kt);
       sc::SinOsc osc; osc.Init(&kt, 750.0, 7.0f);
       sc::Impulse imp; imp.Init(750.0, 1.0f);
       sc::Peak u; u.Init();
@@ -258,7 +271,7 @@ int main() {
       if (!ref_check("Peakkr", out.data(), 48000)) ++g_failures;
     }
     { // Gate.ar(SinOsc.ar(440), LFPulse.kr(2)) — ar block loop
-      static sc::KitTables kt; sc::InitKitTables(&kt);
+      static sc::KitTables kt; InitKitTablesFull(&kt);
       sc::SinOsc osc; osc.Init(&kt, 48000.0, 440.0f);
       sc::LFPulse lp; lp.Init(750.0, 2.0f, 0.0f, 0.5f);
       sc::Gate g; g.Init();
@@ -282,7 +295,7 @@ int main() {
 
   printf("== T-D2 osc2 kit vs NRT references ==\n");
   {
-    static sc::KitTables kt; sc::InitKitTables(&kt);
+    static sc::KitTables kt; InitKitTablesFull(&kt);
     std::vector<float> out;
     { // Saw.ar(440)
       sc::Saw u; u.Init(&kt, 48000.0, 440.0f);
@@ -348,7 +361,7 @@ int main() {
 
   printf("== T-D2 filter kit vs NRT references ==\n");
   {
-    static sc::KitTables kt; sc::InitKitTables(&kt);
+    static sc::KitTables kt; InitKitTablesFull(&kt);
     std::vector<float> in(48000), out(48000);
     { sc::Saw src; src.Init(&kt, 48000.0, 220.0f);
       for (int b = 0; b < 750; ++b) src.ProcessBlock(in.data() + b * 64, 64); }
@@ -404,7 +417,7 @@ int main() {
 
   printf("== T-D2 Task 7 SC3P filters vs NRT references ==\n");
   {
-    static sc::KitTables kt; sc::InitKitTables(&kt);
+    static sc::KitTables kt; InitKitTablesFull(&kt);
     std::vector<float> in(48000), out(48000);
     { sc::Saw src; src.Init(&kt, 48000.0, 220.0f);
       for (int b = 0; b < 750; ++b) src.ProcessBlock(in.data() + b * 64, 64); }
@@ -435,7 +448,7 @@ int main() {
 
   printf("== T-D2 Task 8 core delay family vs NRT references ==\n");
   {
-    static sc::KitTables kt; sc::InitKitTables(&kt);
+    static sc::KitTables kt; InitKitTablesFull(&kt);
     std::vector<float> in(48000), out(48000);
     { sc::Saw src; src.Init(&kt, 48000.0, 220.0f);
       for (int b = 0; b < 750; ++b) src.ProcessBlock(in.data() + b * 64, 64); }
@@ -455,7 +468,7 @@ int main() {
     delay("AllpassNar", 6, 0.1f);
     delay("AllpassLar", 7, 0.1f);
     delay("AllpassCar", 8, 0.1f);
-    { static sc::KitTables kt2; sc::InitKitTables(&kt2);
+    { static sc::KitTables kt2; InitKitTablesFull(&kt2);
       std::vector<float> trig(48000), outp(48000);
       { sc::Impulse src; src.Init(48000.0, 4.0f);
         for (int b = 0; b < 750; ++b) src.ProcessBlock(trig.data() + b * 64, 64); }
@@ -487,7 +500,7 @@ int main() {
       sc::LocalIn li; li.Init(1); sc::LocalOut lo; lo.Init(1);
       std::vector<float> fb(64), sig(64), dry(64), lout(64), dest(48000);
       const float def0 = 0.f;
-      static sc::KitTables kt2; sc::InitKitTables(&kt2);
+      static sc::KitTables kt2; InitKitTablesFull(&kt2);
       sc::Saw src; src.Init(&kt2, 48000.0, 220.0f);
       for (int b = 0; b < 750; ++b) {
         src.ProcessBlock(dry.data(), 64);
@@ -506,7 +519,7 @@ int main() {
 
   printf("== T-D2 Task 9 reverb vs NRT reference ==\n");
   {
-    static sc::KitTables kt; sc::InitKitTables(&kt);
+    static sc::KitTables kt; InitKitTablesFull(&kt);
     std::vector<float> in(48000), out(48000);
     { sc::Saw src; src.Init(&kt, 48000.0, 220.0f);
       for (int b = 0; b < 750; ++b) src.ProcessBlock(in.data() + b * 64, 64); }
@@ -529,7 +542,7 @@ int main() {
 
   printf("== T-D2 Task 10 pan family vs NRT references ==\n");
   {
-    static sc::KitTables kt; sc::InitKitTables(&kt);
+    static sc::KitTables kt; InitKitTablesFull(&kt);
     std::vector<float> a(48000), b(48000), c(48000), l(48000), r(48000);
     { sc::Saw s; s.Init(&kt, 48000.0, 220.0f);
       for (int i = 0; i < 750; ++i) s.ProcessBlock(a.data() + i * 64, 64); }
@@ -586,7 +599,7 @@ int main() {
 
   printf("== T-D2 GreyholeRaw vs NRT reference ==\n");
   {
-    static sc::KitTables kt; sc::InitKitTables(&kt);
+    static sc::KitTables kt; InitKitTablesFull(&kt);
     std::vector<float> a(48000), b(48000), l(48000), r(48000);
     { sc::Saw s; s.Init(&kt, 48000.0, 220.0f);
       for (int i = 0; i < 750; ++i) s.ProcessBlock(a.data() + i * 64, 64); }
@@ -738,7 +751,7 @@ int main() {
 
   printf("== T-D2 Task 15 sugar vs NRT references ==\n");
   {
-    static sc::KitTables kt; sc::InitKitTables(&kt);
+    static sc::KitTables kt; InitKitTablesFull(&kt);
     std::vector<float> a(48000), b(48000), out(48000);
     { sc::Saw s; s.Init(&kt, 48000.0, 220.0f);
       for (int i = 0; i < 750; ++i) s.ProcessBlock(a.data()+i*64, 64); }
@@ -763,7 +776,7 @@ int main() {
 
   printf("== T-D2 Task 14 SC3P dynamics vs NRT references ==\n");
   {
-    static sc::KitTables kt; sc::InitKitTables(&kt);
+    static sc::KitTables kt; InitKitTablesFull(&kt);
     std::vector<float> a(48000), b(48000), out(48000);
     { sc::Saw s; s.Init(&kt, 48000.0, 220.0f);
       for (int i = 0; i < 750; ++i) s.ProcessBlock(a.data() + i*64, 64); }
@@ -793,7 +806,7 @@ int main() {
 
   printf("== T-D2 dynamics kit vs NRT references ==\n");
   {
-    static sc::KitTables kt; sc::InitKitTables(&kt);
+    static sc::KitTables kt; InitKitTablesFull(&kt);
     std::vector<float> in(48000), ctrl(48000), hot(48000), out(48000);
     { sc::Saw src; src.Init(&kt, 48000.0, 220.0f);
       for (int b = 0; b < 750; ++b) src.ProcessBlock(in.data() + b * 64, 64); }
@@ -853,7 +866,7 @@ int main() {
     { sc::Phasor u; u.Init(750.0, 0.001, 0.0, 1.0, 0.0f); if (!ref_kr_fill("Phasorkr", u, out)) ++g_failures; }
     { // Clip.kr(SinOsc.kr(5), -0.5, 0.5): the input is a kr SinOsc ramped by K2A,
       // then clamped — replicate the whole chain.
-      sc::SinOsc osc; static sc::KitTables kt_local; sc::InitKitTables(&kt_local);
+      sc::SinOsc osc; static sc::KitTables kt_local; InitKitTablesFull(&kt_local);
       osc.Init(&kt_local, 750.0, 5.0f);
       out.assign(48000, 0.0f);
       // Clip.kr reads its kr input as a VALUE (no ramp), clips, then K2A
@@ -877,7 +890,7 @@ int main() {
       if (!ref_check("Clipkr", out.data(), 48000)) ++g_failures;
     }
     { // Fold.kr(SinOsc.kr(5) * 3, -0.5, 0.5)
-      sc::SinOsc osc; static sc::KitTables kt_local2; sc::InitKitTables(&kt_local2);
+      sc::SinOsc osc; static sc::KitTables kt_local2; InitKitTablesFull(&kt_local2);
       osc.Init(&kt_local2, 750.0, 5.0f);
       out.assign(48000, 0.0f);
       float prev = 0.0f;
@@ -901,7 +914,7 @@ int main() {
     { std::vector<float> consts(48000, 0.25f);
       if (!ref_check("DCkr", consts.data(), 48000)) ++g_failures; }
     { // A2K.kr(SinOsc.ar(440)): first ar sample per block, K2A-ramped
-      sc::SinOsc osc; static sc::KitTables kt_local3; sc::InitKitTables(&kt_local3);
+      sc::SinOsc osc; static sc::KitTables kt_local3; InitKitTablesFull(&kt_local3);
       osc.Init(&kt_local3, 48000.0, 440.0f);
       out.assign(48000, 0.0f);
       float prev = 0.0f;
@@ -970,6 +983,31 @@ int main() {
       }
     }
     (void)fails_before;
+  }
+
+  // ---- nova tanh law (sc_kit_nova.h, benjolin prep) ----
+  {
+    // odd function: sign must survive the small path (|x| < 0.625).
+    if (!(std::abs(sc::NovaTanh(-0.5f) + sc::NovaTanh(0.5f)) < 1e-9f)) ++g_failures;
+    // sign at the boundary: -0.63 must be NEGATIVE (the abs_arg bug made it ~+0.556).
+    if (!(sc::NovaTanh(-0.63f) < -0.55f)) ++g_failures;
+    // continuity across the 0.625 path switch (polynomial vs exp medium path).
+    if (!(std::abs(sc::NovaTanh(0.625f) - sc::NovaTanh(0.6249f)) < 5e-3f)) ++g_failures;
+    // saturation.
+    if (!(sc::NovaTanh(30.0f) > 0.999999f && sc::NovaTanh(-30.0f) < -0.999999f)) ++g_failures;
+  }
+  // ---- Dfm1 SetParams(3-arg) == Init (bit-exact, benjolin prep) ----
+  {
+    sc::Dfm1 a, b;
+    a.Init(48000.0, 1795055191, 1000.f, 0.1f, 1.f, 0.f, 0.0003f);
+    b.Init(48000.0, 1795055191, 440.f, 0.2f, 2.f, 0.f, 0.0003f);
+    b.SetParams(1000.f, 0.1f, 1.f);
+    float ia[64], ib[64];
+    const float in[64] = {};
+    a.ProcessBlock(in, ia, 64);
+    b.ProcessBlock(in, ib, 64);
+    for (int i = 0; i < 64; ++i)
+      if (ia[i] != ib[i]) { ++g_failures; break; }
   }
 
   printf("test_kit: %s (%d failures)\n", g_failures ? "FAIL" : "PASS", g_failures);

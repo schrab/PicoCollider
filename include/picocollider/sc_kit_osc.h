@@ -78,6 +78,12 @@ inline void InitKitTables(KitTables* t) {
   // The pairs come from consecutive sine samples; they are computed from the
   // sine law directly (the full gSine array may not exist yet — lazy BLIT
   // tables, T-D2 device memory law).
+  //
+  // CONTRACT: this leaves sine_full/cosecant NULL. The BLIT family (Saw,
+  // SinOscFB, Pulse) dereferences them — the caller MUST run BuildPulseTables
+  // on its own storage before constructing one, or it segfaults (this broke
+  // the kit gate silently between 3cfd4a2 and 2026-11-22; see test_kit.cc
+  // InitKitTablesFull for the reference pattern).
   float val1, val2;
   float* out = t->sine_wt - 1;
   for (int i = 0; i < kSineSize - 1; ++i) {

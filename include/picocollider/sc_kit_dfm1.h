@@ -164,7 +164,13 @@ struct Dfm1 {
     l_ = lt; h_ = ht; a_ = at; b_ = bt; r_ = rt; s_ = st;
     za_ = za; zb_ = zb; zh_ = zh; zr_ = zr; zy_ = zy;
   }
-  void SetParams(float freq, float res) { freq_ = freq; res_ = res; }
+  void SetParams(float freq, float res) { SetParams(freq, res, gain_); }
+  // Benjolin modulates inputgain live; upstream samples it at block rate
+  // alongside freq/res (TJUGens wrapper). Never re-Init to change gain —
+  // that would re-seed the rnor stream.
+  void SetParams(float freq, float res, float input_gain) {
+    freq_ = freq; res_ = res; gain_ = input_gain;
+  }
 
  private:
   static double Check(double x) {
