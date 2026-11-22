@@ -86,36 +86,12 @@ struct Filter2Pole {
     q_ = q;
     have_freq_ = true;
   }
-  // AR-freq law (upstream RLPF/RHPF next_a) — for freq WIRES that change per
-  // sample: the coefficients recompute IMMEDIATELY on a wire change and the
-  // new values apply to THAT sample (no k-law block ramp, no zapgremlins —
-  // next_a has neither). The ctor prime is the same next_1(unit,1) step for
-  // both laws. Without this, per-sample freq sweeps run the k-law's block
-  // path and the coefficients lag one sample (found via the benjolin loop1
-  // golden: the register fill sweeps the filter freq 113 Hz -> 111.6 kHz
-  // within one block; the k-law path could not track it).
-  float StepA(float in, float freq, float q) {
-    if (!primed_) {
-      const double rps = 2.0 * M_PI / sr_;
-      ComputeCoefs(freq, q, rps, &a0_, &b1_, &b2_);
-      primed_ = true;
-      have_freq_ = true;
-      freq_ = freq;
-      q_ = q;
-    } else if (freq != freq_ || q != q_) {
-      const double rps = 2.0 * M_PI / sr_;
-      ComputeCoefs(freq, q, rps, &a0_, &b1_, &b2_);
-      freq_ = freq;
-      q_ = q;
-    }
-    float out;
-    Step(in, out, a0_, b1_, b2_, y1_, y2_);
-    return out;
+  static double ZapGremlins(double x) {
+    // SC_InlineUnaryOp zapgremlins: NaN/inf/huge -> 0
+    return (x < 3.4e38 && x > -3.4e38) ? x : 0.0;
   }
-  // The ctor genrates one sample per the source (m_a0..b2 = 0, m_freq NaN)
-  // — the state stays zeroed here, which matches next_1's in=ZIN0(0) only
-  // when the first input is 0; drones call with their own first sample.
-
+  double sr_ = 48000.0;
+  int kind_ = 0;
  private:
   void ComputeCoefs(float freq, float q, double rps, double* a0, double* b1,
                     double* b2) const {
@@ -168,12 +144,6 @@ struct Filter2Pole {
       y1 = y0;
     }
   }
-  static double ZapGremlins(double x) {
-    // SC_InlineUnaryOp zapgremlins: NaN/inf/huge -> 0
-    return (x < 3.4e38 && x > -3.4e38) ? x : 0.0;
-  }
-  double sr_ = 48000.0;
-  int kind_ = 0;
   double a0_ = 0.0, b1_ = 0.0, b2_ = 0.0, y1_ = 0.0, y2_ = 0.0;
   float freq_ = 0.0f, q_ = 0.0f;
   bool have_freq_ = false;

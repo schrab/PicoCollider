@@ -11,18 +11,23 @@
 #ifndef RACK_SRC_DRONECASTER_SC_KIT_LOCALIO_H_
 #define RACK_SRC_DRONECASTER_SC_KIT_LOCALIO_H_
 #include <cstdint>
-#include <vector>
 
 namespace sc {
 
 struct LocalBus {
+  // Fixed storage (2 ch max — the kit's LocalIO golden uses 1, the benjolin
+  // engine 2): no heap, so the device audio path can Init() freely.
   void Init(int channels) {
-    buf_.assign(static_cast<size_t>(channels) * 64, 0.f);
-    touched_.assign(static_cast<size_t>(channels), -1);
+    channels_ = channels <= 2 ? channels : 2;
+    for (int ch = 0; ch < 2; ++ch) {
+      touched_[ch] = -1;
+      for (int i = 0; i < 64; ++i) buf_[ch * 64 + i] = 0.f;
+    }
   }
-  float* Channel(int ch) { return buf_.data() + static_cast<size_t>(ch) * 64; }
-  std::vector<float> buf_;
-  std::vector<int32_t> touched_;
+  float* Channel(int ch) { return buf_ + static_cast<size_t>(ch) * 64; }
+  float buf_[2 * 64];
+  int32_t touched_[2];
+  int channels_ = 1;
 };
 
 struct LocalIn {
