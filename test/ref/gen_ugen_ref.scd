@@ -115,6 +115,34 @@
         // scsynth launch; the C++ port re-seeds from that same value.
         ["DFM1",       { Out.ar(0, DFM1.ar(Saw.ar(220), 1000, 0.1, 1, 0, 0.0003)) }],
 
+        // ---- benjolin prep (2026-11-22): the .ar forms + params benjolin uses ----
+        ["Tanh",         { Out.ar(0, (SinOsc.ar(220) * 3).tanh.dup) }],
+        // midicps law ref: the *64 +64 scaling is EXACT in float32 (powers of
+        // two / representable sums), so the only difference source left is
+        // the pow itself. (A LinLin chain couldn't gate at 1e-6: scsynth's
+        // FMA MulAdd rounds differently from the kit's two-op mul-add.)
+        ["Midicps",      { Out.ar(0, (LFNoise0.ar(400) * 64 + 64).midicps.dup) }],
+        ["Latchar",      { Out.ar(0, Latch.ar(SinOsc.ar(220), Impulse.ar(100)).dup) }],
+        ["Selectar",     { Out.ar(0, Select.ar(LFNoise0.ar(400).range(0, 3),
+                            [DC.ar(0.1), SinOsc.ar(220), LFSaw.ar(110), DC.ar(0.5)]).dup) }],
+        ["Clipar",       { Out.ar(0, Clip.ar(LFNoise1.ar(400).range(-2, 2), -0.5, 0.5).dup) }],
+        ["PulseDPWar05", { Out.ar(0, PulseDPW.ar(220, 0.5).dup) }],
+        // DFM1 in the SHAPE benjolin uses: type=1 (high-pass), noiselevel =
+        // upstream default 0.0003, inputgain=1 (the port's live gain is
+        // covered by the full-SynthDef golden, not a kit ref).
+        ["DFM1hp",       { Out.ar(0, DFM1.ar(Saw.ar(220), 1000, 0.1, 1, 1, 0.0003)) }],
+        // 2-channel LocalIn/LocalOut: OPEN graph (the closed-loop 1-block
+        // law is the mono LocalIO golden's job; an NRT local bus is NOT
+        // zeroed at block 0, so a closed 2-ch loop bakes unreproducible
+        // garbage into every later block). This ref pins: per-channel
+        // independence, the 1-block read delay, and the ACCUMULATE path
+        // (second LocalOut in the same block adds onto the first's write).
+        // Block 0's read is uninitialized garbage -> compared from s64.
+        ["LocalIO2",     { var io = LocalIn.ar(2, [0, 0]);
+                           LocalOut.ar([SinOsc.ar(220) * 0.1, LFSaw.ar(110) * 0.1]);
+                           LocalOut.ar([DC.ar(0.001), DC.ar(0.002)]);
+                           Out.ar(0, (io[0] + io[1]).dup) }],
+
         // ---- T-D2 Task 8: core delay family (shared ring buffer) ----
         ["DelayNar",   { Out.ar(0, DelayN.ar(Saw.ar(220), 0.01, 0.005)) }, "supernova"],
         ["DelayLar",   { Out.ar(0, DelayL.ar(Saw.ar(220), 0.01, 0.005)) }, "supernova"],
@@ -250,7 +278,7 @@
             cmd = engine ++ " -N " ++ oscPath.quote ++ " _ " ++ wavPath.quote
                 ++ " 48000 WAV float" ++ opts.asOptionsString
                 ++ (if (scsynthFlags != "", { " " ++ scsynthFlags }, { "" }));
-            if (name == "DFM1") {
+            if (name == "DFM1" or: { name == "DFM1hp" }) {
                 // Keep retrying until the whole render stays inside one epoch
                 // second: then the captured value must equal scsynth's
                 // time(NULL) at DFM1_Ctor (no boundary crossed mid-launch).
@@ -259,7 +287,7 @@
                     if (stable.not) {
                         var f;
                         before = Date.getDate.rawSeconds.asInteger;
-                        f = File(outDir ++ "/DFM1.seed.txt", "w");
+                        f = File(outDir ++ "/" ++ name ++ ".seed.txt", "w");
                         f.write(before.asString); f.close;
                         rc = cmd.systemCmd;
                         after = Date.getDate.rawSeconds.asInteger;

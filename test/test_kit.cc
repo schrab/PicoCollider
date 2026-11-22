@@ -14,6 +14,7 @@
 #include "picocollider/sc_kit_greyhole.h"
 #include "picocollider/sc_kit_hw.h"
 #include "picocollider/sc_kit_lfo.h"
+#include "picocollider/sc_kit_lin.h"
 #include "picocollider/sc_kit_localio.h"
 #include "picocollider/sc_kit_noise.h"
 #include "picocollider/sc_kit_nova.h"
@@ -124,6 +125,69 @@ static bool ref_check(const char* name, const float* got, long n) {
   const bool ok = max_abs <= 1e-6 && corr >= 0.999999;
   printf("  REF %-12s %s: max=%.9f corr=%.9f\n", name, ok ? "ok" : "FAIL",
          max_abs, corr);
+  return ok;
+}
+
+// ref_check with a RELATIVE gate — for refs whose output is not an audio
+// signal in +-1 but a wide-range quantity (Midicps emits 8..14000 Hz). The
+// absolute 1e-6 gate is calibrated for +-1 audio; for frequency outputs the
+// honest equivalent is max_abs <= rel * max|ref|. The input stream's own
+// golden tolerance (~1e-6 on the noise) amplifies through midicps' df/dn,
+// so the law is pinned relative to that floor.
+static bool ref_check_rel(const char* name, const float* got, long n,
+                          double rel_gate) {
+  char path[192];
+  snprintf(path, sizeof(path),
+           "ref/ugen_ref/%s.expected.wav", name);
+  l8test::WavFile w = l8test::ReadWav(path);
+  const long wf = static_cast<long>(w.samples.size() / (w.channels ? w.channels : 1));
+  if (w.channels < 1 || wf != n) {
+    printf("  REF %-12s FAIL: layout ref=%ldf got=%ld\n", name, wf, n);
+    return false;
+  }
+  double max_abs = 0.0, num = 0.0, da = 0.0, db = 0.0, ref_peak = 0.0;
+  for (long i = 0; i < n; ++i) {
+    const double a = w.samples[static_cast<size_t>(i) * w.channels];
+    const double b = got[i];
+    const double d = a - b;
+    if (fabs(d) > max_abs) max_abs = fabs(d);
+    if (fabs(a) > ref_peak) ref_peak = fabs(a);
+    num += a * b; da += a * a; db += b * b;
+  }
+  const double corr = (da > 0 && db > 0) ? num / sqrt(da * db) : (da == db ? 1.0 : 0.0);
+  const bool ok = max_abs <= rel_gate * ref_peak && corr >= 0.999999;
+  printf("  REF %-12s %s: max=%.9f rel=%.3g (peak %.0f) corr=%.9f\n", name,
+         ok ? "ok" : "FAIL", max_abs, max_abs / ref_peak, ref_peak, corr);
+  return ok;
+}
+
+// ref_check with a WAV-side start offset — the startup-transient warmup rule
+// (see the DFM1hp check: unreproducible NRT ctor artifacts are skipped; the
+// steady-state law gates at the standard 1e-6 / 0.999999).
+static bool ref_check_n(const char* name, const float* got, long n,
+                        long wav_offset) {
+  char path[192];
+  snprintf(path, sizeof(path),
+           "ref/ugen_ref/%s.expected.wav", name);
+  l8test::WavFile w = l8test::ReadWav(path);
+  const long wf = static_cast<long>(w.samples.size() / (w.channels ? w.channels : 1));
+  if (w.channels < 1 || wf != n + wav_offset) {
+    printf("  REF %-12s FAIL: layout ref=%ldf got=%ld+%ld\n", name, wf, n,
+           wav_offset);
+    return false;
+  }
+  double max_abs = 0.0, num = 0.0, da = 0.0, db = 0.0;
+  for (long i = 0; i < n; ++i) {
+    const double a = w.samples[static_cast<size_t>((i + wav_offset) * w.channels)];
+    const double b = got[i];
+    const double d = a - b;
+    if (fabs(d) > max_abs) max_abs = fabs(d);
+    num += a * b; da += a * a; db += b * b;
+  }
+  const double corr = (da > 0 && db > 0) ? num / sqrt(da * db) : (da == db ? 1.0 : 0.0);
+  const bool ok = max_abs <= 1e-6 && corr >= 0.999999;
+  printf("  REF %-12s %s: max=%.9f corr=%.9f (warmup %ld skipped)\n", name,
+         ok ? "ok" : "FAIL", max_abs, corr, wav_offset);
   return ok;
 }
 
@@ -1008,6 +1072,131 @@ int main() {
     b.ProcessBlock(in, ib, 64);
     for (int i = 0; i < 64; ++i)
       if (ia[i] != ib[i]) { ++g_failures; break; }
+  }
+
+  printf("== benjolin prep kit vs NRT references ==\n");
+  {
+    static sc::KitTables kt; InitKitTablesFull(&kt);
+    std::vector<float> out(48000);
+
+    { // Tanh: (SinOsc.ar(220) * 3).tanh — pins NovaTanh vs scsynth's tanh
+      // (the scsynth-vs-nova equivalence proof; see assessment §4.1 caveat).
+      sc::SinOsc osc; osc.Init(&kt, 48000.0, 220.0f);
+      for (int i = 0; i < 48000; ++i)
+        out[i] = sc::NovaTanh(osc.Process() * 3.0f);
+      if (!ref_check("Tanh", out.data(), 48000)) ++g_failures;
+    }
+    { // Midicps: (LFNoise0.ar(400) * 64 + 64).midicps — pins the ar float-pow
+      // law (sc::midicps_ar, SC_InlineUnaryOp float32 overload) pointwise;
+      // the *64/+64 scaling is exact in float32, so pow is the only variable.
+      sc::RGen r; r.init(sc::kGoldenSeed);
+      sc::LFNoise0 noise; noise.Init(&r, 48000.0, 400.0f);
+      for (int b = 0; b < 750; ++b) {
+        float blk[64];
+        noise.ProcessBlock(blk, 64);
+        for (int i = 0; i < 64; ++i)
+          out[b * 64 + i] = sc::midicps_ar(blk[i] * 64.0f + 64.0f);
+      }
+      if (!ref_check_rel("Midicps", out.data(), 48000, 1e-6)) ++g_failures;
+    }
+    { // Latchar: Latch.ar(SinOsc.ar(220), Impulse.ar(100)) — the .ar
+      // rising-edge path per sample (kit Latch golden is kr-only).
+      sc::SinOsc osc; osc.Init(&kt, 48000.0, 220.0f);
+      sc::Impulse imp; imp.Init(48000.0, 100.0f);
+      sc::Latch lat;
+      for (int i = 0; i < 48000; ++i)
+        out[i] = lat.Next(osc.Process(), imp.Next());
+      if (!ref_check("Latchar", out.data(), 48000)) ++g_failures;
+    }
+    { // Selectar: Select.ar(LFNoise0.ar(400).range(0,3), [DC, SinOsc, LFSaw,
+      // DC]) — per-sample ar index through sc::SelectIndex; all sources
+      // advance every sample (SC renders every branch).
+      sc::RGen r; r.init(sc::kGoldenSeed);
+      sc::LFNoise0 noise; noise.Init(&r, 48000.0, 400.0f);
+      sc::LinLin lin3; lin3.Init(-1.0f, 1.0f, 0.0f, 3.0f);
+      sc::SinOsc osc; osc.Init(&kt, 48000.0, 220.0f);
+      sc::LFSaw saw; saw.Init(48000.0, 110.0f);
+      for (int b = 0; b < 750; ++b) {
+        float blk[64];
+        noise.ProcessBlock(blk, 64);
+        for (int i = 0; i < 64; ++i) {
+          const float srcs[4] = {0.1f, osc.Process(), saw.Next(), 0.5f};
+          out[b * 64 + i] = srcs[sc::SelectIndex(lin3.Next(blk[i]), 4)];
+        }
+      }
+      if (!ref_check("Selectar", out.data(), 48000)) ++g_failures;
+    }
+    { // Clipar: Clip.ar(LFNoise1.ar(400).range(-2, 2), -0.5, 0.5) — the .ar
+      // Clip law (kit golden is kr-only).
+      sc::RGen r; r.init(sc::kGoldenSeed);
+      sc::LFNoise1 noise; noise.Init(&r, 48000.0, 400.0f);
+      sc::LinLin lin2; lin2.Init(-1.0f, 1.0f, -2.0f, 2.0f);
+      for (int b = 0; b < 750; ++b) {
+        float blk[64];
+        noise.ProcessBlock(blk, 64);
+        for (int i = 0; i < 64; ++i)
+          out[b * 64 + i] = sc::ClipTo(lin2.Next(blk[i]), -0.5f, 0.5f);
+      }
+      if (!ref_check("Clipar", out.data(), 48000)) ++g_failures;
+    }
+    { // PulseDPW.ar(220, 0.5) — the width the SynthDef actually uses
+      // (existing golden is w=0.3).
+      sc::PulseDPW u; u.Init(48000.0, 220.0f, 0.5f, 0);
+      if (!ref_ar_fill("PulseDPWar05", u, out)) ++g_failures;
+    }
+    { // DFM1.ar(Saw.ar(220), 1000, 0.1, 1, 1, 0.0003) — TYPE=1 high-pass,
+      // the shape benjolin uses (existing golden is lowpass type=0).
+      // WARMUP RULE: the installed sc3-plugins build emits an unreproducible
+      // ~5-sample ctor transient in the DFM1 render (uninitialized wire
+      // buffer at synth ctor time — s0 is the clamp constant 2/3*POST_GAIN
+      // = 0.95 exactly; the pinned-source wrapper we transcribed has no
+      // prime). The NOISE stream aligns from s5 (same seed epoch), so the
+      // steady-state law is gated from sample 8 on at the standard gate.
+      const long kWarmup = 8;
+      std::vector<float> in(48000);
+      { sc::Saw src; src.Init(&kt, 48000.0, 220.0f);
+        for (int b = 0; b < 750; ++b) src.ProcessBlock(in.data() + b * 64, 64); }
+      long epoch = 0;
+      FILE* sf = fopen("ref/ugen_ref/DFM1hp.seed.txt", "r");
+      if (sf) { if (fscanf(sf, "%ld", &epoch) != 1) epoch = 0; fclose(sf); }
+      if (epoch == 0) { printf("  FAIL: DFM1hp seed file missing\n"); ++g_failures; }
+      sc::Dfm1 u; u.Init(48000.0, static_cast<int>(epoch), 1000.0f, 0.1f,
+                         1.0f, 1.0f, 0.0003f);
+      for (int b = 0; b < 750; ++b)
+        u.ProcessBlock(in.data() + b * 64, out.data() + b * 64, 64);
+      if (!ref_check_n("DFM1hp", out.data() + kWarmup, 48000 - kWarmup,
+                       kWarmup)) ++g_failures;
+    }
+    { // LocalIO2: open 2-channel LocalIn/LocalOut — per-channel independence,
+      // the 1-block read delay, and the ACCUMULATE path (second LocalOut in
+      // the same block). Block 0's read is the renderer's uninitialized local
+      // bus -> warmup rule skips it (see the DFM1hp note).
+      const long kWarmup = 64;
+      sc::LocalBus bus; bus.Init(2);
+      sc::LocalIn lin; lin.Init(2);
+      sc::LocalOut lout; lout.Init(2);
+      sc::SinOsc osc; osc.Init(&kt, 48000.0, 220.0f);
+      sc::LFSaw saw; saw.Init(48000.0, 110.0f);
+      const float defaults[2] = {0.f, 0.f};
+      float add0[64], add1[64];
+      for (int i = 0; i < 64; ++i) { add0[i] = 0.001f; add1[i] = 0.002f; }
+      for (int b = 0; b < 750; ++b) {
+        float c0[64], c1[64], w0[64], w1[64];
+        float* inr[2] = {c0, c1};
+        lin.ProcessBlock(bus, inr, defaults, b, 64);
+        for (int i = 0; i < 64; ++i) {
+          w0[i] = osc.Process() * 0.1f;
+          w1[i] = saw.Next() * 0.1f;
+        }
+        const float* obr1[2] = {w0, w1};
+        lout.ProcessBlock(bus, obr1, b, 64);   // replaces (first write)
+        const float* obr2[2] = {add0, add1};
+        lout.ProcessBlock(bus, obr2, b, 64);   // accumulates (touched == b)
+        for (int i = 0; i < 64; ++i) out[b * 64 + i] = c0[i] + c1[i];
+      }
+      if (!ref_check_n("LocalIO2", out.data() + kWarmup, 48000 - kWarmup,
+                       kWarmup)) ++g_failures;
+    }
   }
 
   printf("test_kit: %s (%d failures)\n", g_failures ? "FAIL" : "PASS", g_failures);

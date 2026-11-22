@@ -17,6 +17,15 @@ inline float clampf(float x, float lo, float hi) {
 }
 inline float midicps(float n) { return 440.0f * powf(2.0f, (n - 69.0f) / 12.0f); }
 inline float cpsmidi(float f) { return 12.0f * log2f(f / 440.0f) + 69.0f; }
+// scsynth's ar midicps law (SC_InlineUnaryOp.h @ Version-3.14.1, float32
+// overload — ar inputs are float, so it is FLOAT pow, all-float math):
+//   440.f * std::pow(2.f, (note - 69.f) / 12.f)
+// The double-pow variant drifts ~1.5e-6 relative at the top of the range
+// (0.0195 Hz at ~12.5 kHz) — far past the 1e-6 golden gate. Verified against
+// the Midicps kit golden (2026-11-22).
+inline float midicps_ar(float n) {
+  return 440.f * std::pow(2.f, (n - 69.f) / 12.f);
+}
 
 }  // namespace sc
 #endif
