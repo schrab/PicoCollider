@@ -127,6 +127,18 @@
                             [DC.ar(0.1), SinOsc.ar(220), LFSaw.ar(110), DC.ar(0.5)]).dup) }],
         ["Clipar",       { Out.ar(0, Clip.ar(LFNoise1.ar(400).range(-2, 2), -0.5, 0.5).dup) }],
         ["PulseDPWar05", { Out.ar(0, PulseDPW.ar(220, 0.5).dup) }],
+        // benjolin startup DPW: the exact float freq the engine's osc1 runs
+        // at before the first register flip (midicps_ar(0)*0.16 + 40).
+        // benjolin startup DPW: the freq is computed ON THE SERVER (DC.ar
+        // through the float midicps law, like the benjolin graph's bus-fed
+        // freq) so the arg float matches the engine's exactly. The AR wire
+        // makes scsynth run SawDPW_next_a — the ar-freq law.
+        ["PulseDPW413", { Out.ar(0, PulseDPW.ar(DC.ar(0).midicps * 0.16 + 40, 0.5).dup) }],
+        // benjolin transition DPW: freq jumps 40 -> midicps(0)*0.16+40 at
+        // block 1 (the AR Select gate has no CALCSLOPE ramp).
+        ["PulseDPWjump", { var f40 = (DC.ar(0).midicps * 0.16 + 40) - DC.ar(40) + DC.ar(40);
+                           var fq = Select.ar(Sweep.kr > 0, [DC.ar(40), DC.ar(0).midicps * 0.16 + 40]);
+                           Out.ar(0, PulseDPW.ar(fq, 0.5).dup) }],
         // DFM1 in the SHAPE benjolin uses: type=1 (high-pass), noiselevel =
         // upstream default 0.0003, inputgain=1 (the port's live gain is
         // covered by the full-SynthDef golden, not a kit ref).

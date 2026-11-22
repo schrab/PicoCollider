@@ -215,6 +215,22 @@ struct SawDPW {
     for (int i = 0; i < n; ++i) out[i] = ProcessBlockOne(freq_in_);
   }
   float ctor_value() const { return primed_; }
+  // AR-freq law (upstream SawDPW_next_a) — for freq wires that change per
+  // sample. The ctor prime is the SAME next_a(unit,1) step for both laws
+  // (upstream runs it before dispatch matters); the a-law scalefac is the
+  // f_Hz formula and is recomputed per sample when the wire value changes.
+  void InitAr(double sr, float freq, double iphase) {
+    sr_ = sr;
+    freqmul_ = static_cast<float>(2.0 * (1.0 / sr));
+    val_ = 0.0f;
+    freq_a_ = 0.0f;    // upstream mFreq = 0 -> the prime's recompute fires
+    scalefac_ = 0.0f;
+    phase_ = iphase;
+    StepA(freq);       // the ctor prime: next_a(unit, 1), state KEPT
+    freq_in_a_ = freq;
+  }
+  void SetFreqA(float f) { freq_in_a_ = f; }
+  float NextA() { return StepA(freq_in_a_); }
  private:
   float ProcessBlockOne(float f) {
     const float freq = f * freqmul_;
@@ -236,23 +252,64 @@ struct SawDPW {
   double sr_ = 48000.0, phase_ = 0.0;
   float freqmul_ = 0.0f, freq_ = 0.0f, freq_in_ = 440.0f;
   float val_ = 0.0f, scalefac_ = 0.0f, primed_ = 0.0f;
+  float StepA(float f) {
+    phase_ += f * freqmul_;
+    if (phase_ >= 1.0) phase_ -= 2.0;
+    if (phase_ < -1.0) phase_ += 2.0;
+    const float oldval = val_;
+    val_ = static_cast<float>(phase_ * phase_);
+    float scalefac = scalefac_;
+    if (f != freq_a_) {
+      freq_a_ = f;
+      // SAMPLERATE / (8.f * f * (1.f - f/SAMPLERATE)): 8.f*f is a FLOAT
+      // multiply; f/SAMPLERATE promotes to double; the rest is double.
+      scalefac = static_cast<float>(
+          sr_ / (static_cast<double>(8.0f * f) *
+                 (1.0f - static_cast<double>(f) / sr_)));
+      scalefac_ = scalefac;
+    }
+    return (val_ - oldval) * scalefac;
+  }
+  float freq_a_ = 0.0f, freq_in_a_ = 440.0f;
 };
 
 // PulseDPW = SawDPW(freq, 0) - SawDPW(freq, wrap(2*width, -1, 1))
+//
+// TWO SERVER LAWS (scsynth dispatches on the freq input's rate):
+//  - freq is a CONSTANT/scalar arg -> SawDPW_next_k: the scalefac is the
+//    NORMALIZED-freq formula 1/(4*fn*(1-fn/SAMPLERATE)), recomputed once
+//    per block when it changes. Init() + Next() implement this law.
+//  - freq is an AR wire (the benjolin graph: bus-fed FM frequencies)
+//    -> SawDPW_next_a: the scalefac is SAMPLERATE/(8.f*f*(1.f-f/SAMPLERATE))
+//    (f in Hz, 8.f*f a FLOAT multiply, f/SAMPLERATE promoted to double),
+//    recomputed per sample when the wire value changes. InitAr() + NextA()
+//    implement this law; the ctor prime is next_a(unit,1) in BOTH cases
+//    (upstream runs the prime before dispatch matters), which is why
+//    InitAr's prime keeps the a-law scalefac.
 struct PulseDPW {
   void Init(double sr, float freq, float width, int n /*unused*/) {
     a_.Init(sr, freq, 0.0);
     b_.Init(sr, freq, static_cast<double>(sc_wrap(2.0f * width, -1.0f, 1.0f)));
     a_.SetFreq(freq);
     b_.SetFreq(freq);
+    ar_ = false;
+  }
+  // AR-freq mode: per-sample SetFreqA + NextA run the next_a law.
+  void InitAr(double sr, float freq, float width) {
+    a_.InitAr(sr, freq, 0.0);
+    b_.InitAr(sr, freq, static_cast<double>(sc_wrap(2.0f * width, -1.0f, 1.0f)));
+    ar_ = true;
   }
   void SetFreq(float f) { a_.SetFreq(f); b_.SetFreq(f); }
-  float Next() { return a_.Next() - b_.Next(); }
+  void SetFreqA(float f) { a_.SetFreqA(f); b_.SetFreqA(f); }
+  float Next() { return ar_ ? NextA() : (a_.Next() - b_.Next()); }
+  float NextA() { return a_.NextA() - b_.NextA(); }
   void ProcessBlock(float* out, int n) {
     for (int i = 0; i < n; ++i) out[i] = Next();
   }
  private:
   SawDPW a_, b_;
+  bool ar_ = false;
 };
 
 // Select: index law — (int)index + 1 clipped to [1, numInputs-1] (i.e. the
